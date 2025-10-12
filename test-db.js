@@ -1,19 +1,23 @@
-import 'dotenv/config';
-import mysql from 'mysql2/promise';
+import mysql from "mysql2/promise";
 
-async function testConnection() {
-  try {
-    const conn = await mysql.createConnection({
-      host: process.env.DB_HOST,
-      user: process.env.DB_USER,
-      password: process.env.DB_PASS,
-      database: process.env.DB_NAME,
-    });
-    console.log('✅ Connected successfully to Hostinger MySQL!');
-    await conn.end();
-  } catch (err) {
-    console.error('❌ Connection failed:', err.message);
-  }
-}
+const pool = mysql.createPool({
+  host: process.env.DB_HOST,
+  user: process.env.DB_USER,
+  password: process.env.DB_PASS,
+  database: process.env.DB_NAME,
+  waitForConnections: true,
+  connectionLimit: 10,
+  queueLimit: 0,
+});
 
-testConnection();
+// Test connection on startup
+pool.getConnection()
+  .then(connection => {
+    console.log('✅ Database pool connected successfully!');
+    connection.release();
+  })
+  .catch(err => {
+    console.error('❌ Database pool connection failed:', err.message);
+  });
+
+export default pool;
