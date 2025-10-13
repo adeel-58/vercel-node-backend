@@ -2,6 +2,8 @@ import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import authRoutes from "./api/auth.js";
+import sellerRoutes from "./api/seller.js";
+//import { SpeedInsights } from "@vercel/speed-insights/next"
 
 dotenv.config();
 
@@ -20,7 +22,7 @@ app.get("/", (req, res) => {
 
 // Authentication Routes
 app.use("/api/auth", authRoutes);
-
+app.use("/api/seller", sellerRoutes);
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🚀 Server running on http://localhost:${PORT}`));
 
