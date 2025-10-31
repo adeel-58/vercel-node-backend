@@ -3,9 +3,19 @@ import express from "express";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import queryDB from "../db.js"; // <-- use the stable query helper
-
+import nodemailer from "nodemailer";
 const router = express.Router();
 const JWT_SECRET = process.env.JWT_SECRET || "your-secret-key-change-in-production";
+// ---------------------------
+// Email Transporter (Nodemailer)
+// ---------------------------
+const transporter = nodemailer.createTransport({
+  service: "gmail",
+  auth: {
+    user: process.env.EMAIL_USER,
+    pass: process.env.EMAIL_PASS,
+  },
+});
 
 /**
  * Helper: centralized DB error responder
@@ -273,6 +283,143 @@ router.post("/login", async (req, res) => {
       },
       sellerProfile,
       supplierProfile,
+    });
+  } catch (err) {
+    return handleDBError(res, err);
+  }
+});
+/**
+ * ----------------------------
+ * FORGOT PASSWORD
+ * ----------------------------
+ * Request a password reset link (sent to email)
+ */
+router.post("/forgot-password", async (req, res) => {
+  const { email } = req.body;
+
+  if (!email) {
+    return res.status(400).json({
+      success: false,
+      message: "Email is required",
+    });
+  }
+
+  try {
+    const users = await queryDB("SELECT id, email, username FROM `User` WHERE email = ?", [email]);
+    if (!users || users.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "No account found with this email",
+      });
+    }
+
+    const user = users[0];
+
+    // generate a short-lived reset token (15 min expiry)
+    const resetToken = jwt.sign(
+      { userId: user.id, email: user.email },
+      JWT_SECRET,
+      { expiresIn: "15m" }
+    );
+
+    // construct reset link
+    const resetLink = `${process.env.FRONTEND_URL || "http://localhost:5173"}/reset-password?token=${resetToken}`;
+
+    /**
+     * 📨 TODO: Send email via Nodemailer or any service
+     * For now, we'll return it for testing purposes.
+     */
+    // ---------------------------
+// Send Password Reset Email
+// ---------------------------
+const mailOptions = {
+  from: process.env.EMAIL_FROM,
+  to: email,
+  subject: "Password Reset Request - Storensupply",
+  html: `
+    <div style="font-family: Arial, sans-serif; color: #333;">
+      <h2>Storensupply Password Reset</h2>
+      <p>Hi ${user.username || "there"},</p>
+      <p>You requested to reset your password. Please click the link below to set a new password:</p>
+      <p><a href="${resetLink}" style="color: #1a73e8;">Reset Password</a></p>
+      <p><b>Note:</b> This link will expire in 15 minutes.</p>
+      <p>If you didn’t request this, please ignore this email.</p>
+      <br/>
+      <p>— Storensupply Support</p>
+    </div>
+  `,
+};
+
+try {
+  await transporter.sendMail(mailOptions);
+  console.log(`✅ Password reset email sent to ${email}`);
+
+  return res.json({
+    success: true,
+    message: "Password reset email sent successfully",
+  });
+} catch (emailErr) {
+  console.error("❌ Email sending error:", emailErr);
+  return res.status(500).json({
+    success: false,
+    message: "Failed to send password reset email",
+    error: emailErr.message,
+  });
+}
+
+  } catch (err) {
+    return handleDBError(res, err);
+  }
+});
+
+/**
+ * ----------------------------
+ * RESET PASSWORD
+ * ----------------------------
+ * Use the reset token to set a new password
+ */
+router.post("/reset-password", async (req, res) => {
+  const { token, newPassword } = req.body;
+
+  if (!token || !newPassword) {
+    return res.status(400).json({
+      success: false,
+      message: "Token and new password are required",
+    });
+  }
+
+  try {
+    let decoded;
+    try {
+      decoded = jwt.verify(token, JWT_SECRET);
+    } catch (jwtErr) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid or expired token",
+      });
+    }
+
+    // Validate password strength
+    const passwordRegex = /^(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*#?&]).{8,}$/;
+    if (!passwordRegex.test(newPassword)) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "Password must be at least 8 characters long and include one uppercase letter, one number, and one special character.",
+      });
+    }
+
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+
+    // Update user password
+    await queryDB("UPDATE `User` SET password = ? WHERE id = ?", [
+      hashedPassword,
+      decoded.userId,
+    ]);
+
+    return res.json({
+      success: true,
+      message: "Password has been reset successfully",
     });
   } catch (err) {
     return handleDBError(res, err);
