@@ -1,6 +1,6 @@
 // api/supplierProfile.js
 import express from "express";
-import pool from "../db.js";
+import queryDB from "../db.js"; // use the stable queryDB
 
 const router = express.Router();
 
@@ -14,7 +14,7 @@ router.get("/:supplierId", async (req, res) => {
     console.log("👤 Fetching public profile for supplier ID:", supplierId);
 
     // Get Supplier Profile with User info
-    const [supplierProfile] = await pool.query(
+    const supplierProfile = await queryDB(
       `SELECT 
          sp.id,
          sp.store_name,
@@ -44,13 +44,13 @@ router.get("/:supplierId", async (req, res) => {
     const supplier = supplierProfile[0];
 
     // Get Total Products Count
-    const [[productCount]] = await pool.query(
+    const [productCount] = await queryDB(
       `SELECT COUNT(*) as count FROM Product WHERE store_id = ? AND status = 'active'`,
       [supplierId]
     );
 
     // Get Products List (active only)
-    const [products] = await pool.query(
+    const products = await queryDB(
       `SELECT 
          id,
          title,
@@ -67,7 +67,7 @@ router.get("/:supplierId", async (req, res) => {
     );
 
     // Get Average Rating from Reviews
-    const [[avgRating]] = await pool.query(
+    const [avgRating] = await queryDB(
       `SELECT 
          IFNULL(AVG(rating), 0) as avg_rating,
          COUNT(*) as review_count
@@ -75,9 +75,6 @@ router.get("/:supplierId", async (req, res) => {
        WHERE store_id = ? AND review_type = 'supplier'`,
       [supplierId]
     );
-
-    // Increment view count (optional analytics)
-    // You can add a ProfileView table if needed
 
     console.log(`✅ Profile loaded: ${supplier.store_name}, ${products.length} products`);
 
@@ -120,7 +117,7 @@ router.get("/:supplierId/product/:productId", async (req, res) => {
     console.log(`📦 Fetching product ${productId} from supplier ${supplierId}`);
 
     // Get Product Details
-    const [products] = await pool.query(
+    const products = await queryDB(
       `SELECT 
          p.*,
          sp.store_name,
@@ -144,7 +141,7 @@ router.get("/:supplierId/product/:productId", async (req, res) => {
     const product = products[0];
 
     // Get Additional Product Images
-    const [images] = await pool.query(
+    const images = await queryDB(
       `SELECT id, image_url, is_primary
        FROM ProductImage
        WHERE product_id = ?
@@ -153,7 +150,7 @@ router.get("/:supplierId/product/:productId", async (req, res) => {
     );
 
     // Get Product Reviews
-    const [reviews] = await pool.query(
+    const reviews = await queryDB(
       `SELECT 
          r.id,
          r.rating,
@@ -170,7 +167,7 @@ router.get("/:supplierId/product/:productId", async (req, res) => {
     );
 
     // Get Average Rating
-    const [[avgRating]] = await pool.query(
+    const [avgRating] = await queryDB(
       `SELECT 
          IFNULL(AVG(rating), 0) as avg_rating,
          COUNT(*) as review_count
@@ -180,7 +177,7 @@ router.get("/:supplierId/product/:productId", async (req, res) => {
     );
 
     // Increment view count
-    await pool.query(
+    await queryDB(
       `UPDATE Product SET views_count = views_count + 1 WHERE id = ?`,
       [productId]
     );
@@ -253,19 +250,14 @@ router.get("/:supplierId/search", async (req, res) => {
     `;
     const params = [supplierId];
 
-    // Search by title
     if (query) {
       sql += ` AND title LIKE ?`;
       params.push(`%${query}%`);
     }
-
-    // Filter by category
     if (category) {
       sql += ` AND category = ?`;
       params.push(category);
     }
-
-    // Filter by price range
     if (minPrice) {
       sql += ` AND supplier_sold_price >= ?`;
       params.push(parseFloat(minPrice));
@@ -275,7 +267,6 @@ router.get("/:supplierId/search", async (req, res) => {
       params.push(parseFloat(maxPrice));
     }
 
-    // Sorting
     switch (sort) {
       case "price_low":
         sql += ` ORDER BY supplier_sold_price ASC`;
@@ -292,7 +283,7 @@ router.get("/:supplierId/search", async (req, res) => {
         break;
     }
 
-    const [products] = await pool.query(sql, params);
+    const products = await queryDB(sql, params);
 
     console.log(`✅ Found ${products.length} products`);
 
@@ -319,7 +310,7 @@ router.get("/:supplierId/categories", async (req, res) => {
   const { supplierId } = req.params;
 
   try {
-    const [categories] = await pool.query(
+    const categories = await queryDB(
       `SELECT 
          category,
          COUNT(*) as product_count

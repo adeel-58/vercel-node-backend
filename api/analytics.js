@@ -1,6 +1,6 @@
 // api/analytics.js
 import express from "express";
-import pool from "../db.js";
+import queryDB from "../db.js"; // use stable queryDB
 import multer from "multer";
 import fs from "fs";
 import path from "path";
@@ -13,9 +13,7 @@ const router = express.Router();
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
     const uploadPath = "uploads/products";
-    if (!fs.existsSync(uploadPath)) {
-      fs.mkdirSync(uploadPath, { recursive: true });
-    }
+    if (!fs.existsSync(uploadPath)) fs.mkdirSync(uploadPath, { recursive: true });
     cb(null, uploadPath);
   },
   filename: (req, file, cb) => {
@@ -29,17 +27,12 @@ export const upload = multer({ storage });
 export const verifyToken = (req, res, next) => {
   try {
     const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    if (!authHeader || !authHeader.startsWith("Bearer "))
       return res.status(401).json({ success: false, message: "No token provided" });
-    }
 
     const token = authHeader.split(" ")[1];
     jwt.verify(token, JWT_SECRET, (err, decoded) => {
-      if (err) {
-        return res.status(401).json({ success: false, message: "Invalid or expired token" });
-      }
-      
-      console.log("🔐 Decoded JWT Token:", decoded);
+      if (err) return res.status(401).json({ success: false, message: "Invalid or expired token" });
       req.user = decoded;
       next();
     });
@@ -50,117 +43,75 @@ export const verifyToken = (req, res, next) => {
 
 // ------------------ Helper: Get Supplier Profile ID ------------------
 async function getSupplierProfileId(userId) {
-  const [[profile]] = await pool.query(
-    `SELECT id FROM SupplierProfile WHERE user_id = ?`,
-    [userId]
-  );
-  return profile ? profile.id : null;
+  const rows = await queryDB(`SELECT id FROM SupplierProfile WHERE user_id = ?`, [userId]);
+  return rows[0]?.id || null;
 }
 
-// ------------------ DEBUG: Test Token ------------------
+// ------------------ Test Token ------------------
 router.get("/test-token", verifyToken, async (req, res) => {
   const userId = req.user.userId;
   const supplierId = await getSupplierProfileId(userId);
-  
-  res.json({
-    success: true,
-    decoded_user: req.user,
-    user_id: userId,
-    supplier_profile_id: supplierId,
-    message: "Token verified successfully"
-  });
+  res.json({ success: true, decoded_user: req.user, user_id: userId, supplier_profile_id: supplierId });
 });
 
 // ============================
-// 1️⃣ Overall Performance KPIs
+// 1️⃣ Overall KPIs
 // ============================
 router.get("/kpis", verifyToken, async (req, res) => {
   const userId = req.user.userId;
-
   try {
-    console.log("📊 Fetching KPIs for user_id:", userId);
-
     const supplierId = await getSupplierProfileId(userId);
-    if (!supplierId) {
-      return res.status(404).json({ 
-        success: false, 
-        message: "Supplier profile not found. Please complete your supplier setup." 
-      });
-    }
+    if (!supplierId) 
+      return res.status(404).json({ success: false, message: "Supplier profile not found" });
 
-    console.log("📊 Found supplier_profile_id:", supplierId);
-
-    // Debug: Check if products exist
-    const [[productCheck]] = await pool.query(
-      `SELECT COUNT(*) as count FROM Product WHERE store_id = ?`,
-      [supplierId]
-    );
-    console.log("Product Count:", productCheck.count);
-
-    // Debug: Check if ProductSales exist
-    const [[salesCheck]] = await pool.query(
-      `SELECT COUNT(*) as count FROM ProductSales ps 
-       JOIN Product p ON ps.product_id = p.id 
-       WHERE p.store_id = ?`,
-      [supplierId]
-    );
-    console.log("ProductSales Count:", salesCheck.count);
-
-    const [rows] = await pool.query(
+    const rows = await queryDB(
       `SELECT 
-         IFNULL(SUM(p.supplier_purchase_price * ps.quantity_sold), 0) AS total_investment,
-         IFNULL(SUM(ps.total_sale_amount), 0) AS total_sales_value,
-         IFNULL(SUM(ps.profit), 0) AS total_profit,
-         IFNULL(ROUND(SUM(ps.profit)/NULLIF(SUM(ps.total_sale_amount),0)*100,2),0) AS profit_margin,
-         IFNULL(SUM(p.supplier_purchase_price * p.stock_quantity),0) AS stock_value,
-         IFNULL(ROUND(SUM(CASE WHEN p.stock_quantity=0 THEN 1 ELSE 0 END)/NULLIF(COUNT(*),0)*100,2),0) AS out_of_stock_percentage
+        IFNULL(SUM(p.supplier_purchase_price * ps.quantity_sold), 0) AS total_investment,
+        IFNULL(SUM(ps.total_sale_amount), 0) AS total_sales_value,
+        IFNULL(SUM(ps.profit), 0) AS total_profit,
+        IFNULL(ROUND(SUM(ps.profit)/NULLIF(SUM(ps.total_sale_amount),0)*100,2),0) AS profit_margin,
+        IFNULL(SUM(p.supplier_purchase_price * p.stock_quantity),0) AS stock_value,
+        IFNULL(ROUND(SUM(CASE WHEN p.stock_quantity=0 THEN 1 ELSE 0 END)/NULLIF(COUNT(*),0)*100,2),0) AS out_of_stock_percentage
        FROM Product p
-       LEFT JOIN ProductSales ps ON p.id = ps.product_id
+       LEFT JOIN ProductSales ps ON p.id = ps.product_id AND ps.sale_date >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)
        WHERE p.store_id = ?`,
       [supplierId]
     );
 
-    console.log("✅ KPIs Result:", rows[0]);
     res.json(rows[0]);
   } catch (err) {
-    console.error("❌ KPIs Error:", err);
     res.status(500).json({ message: "Server error", error: err.message });
   }
 });
 
+
 // ============================
-// 2️⃣ Time-Based Performance
+// 2️⃣ Sales Trend
 // ============================
 router.get("/sales-trend", verifyToken, async (req, res) => {
   const userId = req.user.userId;
-  const { period = "30" } = req.query;
+  const period = parseInt(req.query.period) || 30;
 
   try {
-    console.log("📈 Fetching sales trend for user_id:", userId);
-
     const supplierId = await getSupplierProfileId(userId);
-    if (!supplierId) {
-      return res.status(404).json({ success: false, message: "Supplier profile not found" });
-    }
+    if (!supplierId) return res.status(404).json({ success: false, message: "Supplier profile not found" });
 
-    const [rows] = await pool.query(
+    const rows = await queryDB(
       `SELECT 
-         DATE(ps.sale_date) AS date,
-         SUM(ps.total_sale_amount) AS total_sales,
-         SUM(ps.profit) AS total_profit,
-         SUM(ps.quantity_sold) AS total_units_sold
+        DATE(ps.sale_date) AS date,
+        SUM(ps.total_sale_amount) AS total_sales,
+        SUM(ps.profit) AS total_profit,
+        SUM(ps.quantity_sold) AS total_units_sold
        FROM ProductSales ps
        JOIN Product p ON ps.product_id = p.id
        WHERE p.store_id = ? AND ps.sale_date >= DATE_SUB(CURDATE(), INTERVAL ? DAY)
        GROUP BY DATE(ps.sale_date)
        ORDER BY date ASC`,
-      [supplierId, parseInt(period)]
+      [supplierId, period]
     );
 
-    console.log(`✅ Sales Trend: Found ${rows.length} days of data`);
     res.json(rows);
   } catch (err) {
-    console.error("❌ Sales Trend Error:", err);
     res.status(500).json({ message: "Server error", error: err.message });
   }
 });
@@ -172,15 +123,10 @@ router.get("/top-products", verifyToken, async (req, res) => {
   const userId = req.user.userId;
 
   try {
-    console.log("🏆 Fetching top products for user_id:", userId);
-
     const supplierId = await getSupplierProfileId(userId);
-    if (!supplierId) {
-      return res.status(404).json({ success: false, message: "Supplier profile not found" });
-    }
+    if (!supplierId) return res.status(404).json({ success: false, message: "Supplier profile not found" });
 
-    // Top 5 Best-Selling Products by quantity
-    const [bestSelling] = await pool.query(
+    const bestSelling = await queryDB(
       `SELECT p.id, p.title, IFNULL(SUM(ps.quantity_sold), 0) AS total_quantity
        FROM Product p
        LEFT JOIN ProductSales ps ON p.id = ps.product_id
@@ -191,8 +137,7 @@ router.get("/top-products", verifyToken, async (req, res) => {
       [supplierId]
     );
 
-    // Top 5 Most Profitable Products
-    const [mostProfitable] = await pool.query(
+    const mostProfitable = await queryDB(
       `SELECT p.id, p.title, IFNULL(SUM(ps.profit), 0) AS total_profit
        FROM Product p
        LEFT JOIN ProductSales ps ON p.id = ps.product_id
@@ -203,11 +148,9 @@ router.get("/top-products", verifyToken, async (req, res) => {
       [supplierId]
     );
 
-    // Category Contribution
-    const [categories] = await pool.query(
-      `SELECT 
-         COALESCE(p.category, 'Uncategorized') AS category, 
-         IFNULL(SUM(ps.total_sale_amount), 0) AS sales_value
+    const categories = await queryDB(
+      `SELECT COALESCE(p.category, 'Uncategorized') AS category, 
+              IFNULL(SUM(ps.total_sale_amount), 0) AS sales_value
        FROM Product p
        LEFT JOIN ProductSales ps ON p.id = ps.product_id
        WHERE p.store_id = ?
@@ -216,69 +159,59 @@ router.get("/top-products", verifyToken, async (req, res) => {
       [supplierId]
     );
 
-    console.log(`✅ Top Products: ${bestSelling.length} best-selling, ${categories.length} categories`);
     res.json({ bestSelling, mostProfitable, categories });
   } catch (err) {
-    console.error("❌ Top Products Error:", err);
     res.status(500).json({ message: "Server error", error: err.message });
   }
 });
 
 // ============================
-// 4️⃣ Stock & Inventory Analytics
+// 4️⃣ Inventory
 // ============================
 router.get("/inventory", verifyToken, async (req, res) => {
   const userId = req.user.userId;
-
   try {
-    console.log("📦 Fetching inventory for user_id:", userId);
-
     const supplierId = await getSupplierProfileId(userId);
-    if (!supplierId) {
-      return res.status(404).json({ success: false, message: "Supplier profile not found" });
-    }
+    if (!supplierId) return res.status(404).json({ success: false, message: "Supplier profile not found" });
 
-    const [rows] = await pool.query(
-      `SELECT 
-         id, title, stock_quantity,
-         supplier_purchase_price,
-         CASE 
-           WHEN stock_quantity = 0 THEN 'Out of Stock'
-           WHEN stock_quantity < 5 THEN 'Low Stock'
-           ELSE 'In Stock'
-         END AS stock_status,
-         DATEDIFF(CURDATE(), created_at) AS age_in_days
+    const rows = await queryDB(
+      `SELECT id, title, stock_quantity,
+              supplier_purchase_price,
+              CASE 
+                WHEN stock_quantity = 0 THEN 'Out of Stock'
+                WHEN stock_quantity < 5 THEN 'Low Stock'
+                ELSE 'In Stock'
+              END AS stock_status,
+              DATEDIFF(CURDATE(), created_at) AS age_in_days
        FROM Product
        WHERE store_id = ?
        ORDER BY stock_quantity ASC`,
       [supplierId]
     );
 
-    console.log(`✅ Inventory: Found ${rows.length} products`);
     res.json(rows);
   } catch (err) {
-    console.error("❌ Inventory Error:", err);
     res.status(500).json({ message: "Server error", error: err.message });
   }
 });
 
 // ============================
-// 5️⃣ Profitability Insights
+// 5️⃣ Profit Insights
 // ============================
 router.get("/profit-insights", verifyToken, async (req, res) => {
   const userId = req.user.userId;
-
   try {
-    console.log("💡 Fetching profit insights for user_id:", userId);
-
     const supplierId = await getSupplierProfileId(userId);
     if (!supplierId) {
-      return res.status(404).json({ success: false, message: "Supplier profile not found" });
+      return res.status(404).json({
+        success: false,
+        message: "Supplier profile not found"
+      });
     }
 
-    // Highest Margin Product
-    const [highestMargin] = await pool.query(
-      `SELECT id, title,
+    // ✅ Highest profit margin product with main image
+    const highestMargin = await queryDB(
+      `SELECT id, title, main_image,
               CASE
                 WHEN supplier_sold_price IS NOT NULL AND supplier_sold_price > 0
                 THEN ROUND((supplier_sold_price - supplier_purchase_price)/supplier_sold_price*100,2)
@@ -291,44 +224,42 @@ router.get("/profit-insights", verifyToken, async (req, res) => {
       [supplierId]
     );
 
-    // Products with No Sales
-    const [noSales] = await pool.query(
-      `SELECT p.id, p.title
+    // ✅ Products with no sales + main images
+    const noSales = await queryDB(
+      `SELECT p.id, p.title, p.main_image
        FROM Product p
        LEFT JOIN ProductSales ps ON p.id = ps.product_id
        WHERE p.store_id = ?
-       GROUP BY p.id, p.title
+       GROUP BY p.id, p.title, p.main_image
        HAVING IFNULL(SUM(ps.quantity_sold), 0) = 0`,
       [supplierId]
     );
 
-    console.log(`✅ Profit Insights: ${noSales.length} products with no sales`);
-    res.json({ 
+    res.json({
       highestMargin: highestMargin[0] || null,
-      noSales 
+      noSales
     });
+
   } catch (err) {
-    console.error("❌ Profit Insights Error:", err);
-    res.status(500).json({ message: "Server error", error: err.message });
+    res.status(500).json({
+      message: "Server error",
+      error: err.message
+    });
   }
 });
 
+
 // ============================
-// 6️⃣ Forecasting & Stock Recommendation
+// 6️⃣ Forecast & Recommended Stock
 // ============================
 router.get("/forecast", verifyToken, async (req, res) => {
   const userId = req.user.userId;
   const period = parseInt(req.query.period) || 30;
-
   try {
-    console.log("🔮 Fetching forecast for user_id:", userId);
-
     const supplierId = await getSupplierProfileId(userId);
-    if (!supplierId) {
-      return res.status(404).json({ success: false, message: "Supplier profile not found" });
-    }
+    if (!supplierId) return res.status(404).json({ success: false, message: "Supplier profile not found" });
 
-    const [sales] = await pool.query(
+    const sales = await queryDB(
       `SELECT p.id, p.title,
               IFNULL(SUM(ps.quantity_sold)/?, 0) AS avg_daily_sold,
               p.stock_quantity
@@ -346,79 +277,32 @@ router.get("/forecast", verifyToken, async (req, res) => {
       recommended_quantity: Math.max(0, Math.round(item.avg_daily_sold * period - item.stock_quantity))
     }));
 
-    console.log(`✅ Forecast: Generated for ${sales.length} products`);
     res.json({
       predicted_sales: sales.reduce((sum, s) => sum + s.avg_daily_sold * period, 0),
       predicted_profit: "Use historical profit % * predicted_sales",
       recommended_stock
     });
   } catch (err) {
-    console.error("❌ Forecast Error:", err);
     res.status(500).json({ message: "Server error", error: err.message });
   }
 });
 
 // ============================
-// 7️⃣ Alerts & Notifications
+// 7️⃣ Alerts
 // ============================
 router.get("/alerts", verifyToken, async (req, res) => {
   const userId = req.user.userId;
-
   try {
-    console.log("🚨 Fetching alerts for user_id:", userId);
-
     const supplierId = await getSupplierProfileId(userId);
-    if (!supplierId) {
-      return res.status(404).json({ success: false, message: "Supplier profile not found" });
-    }
+    if (!supplierId) return res.status(404).json({ success: false, message: "Supplier profile not found" });
 
-    // Low stock < 5
-    const [lowStock] = await pool.query(
-      `SELECT id, title, stock_quantity 
-       FROM Product 
-       WHERE store_id = ? AND stock_quantity < 5 AND stock_quantity > 0`,
-      [supplierId]
-    );
+    const lowStock = await queryDB(`SELECT id, title, stock_quantity FROM Product WHERE store_id = ? AND stock_quantity < 5 AND stock_quantity > 0`, [supplierId]);
+    const outOfStock = await queryDB(`SELECT id, title FROM Product WHERE store_id = ? AND stock_quantity = 0`, [supplierId]);
+    const agingInventory = await queryDB(`SELECT id, title, DATEDIFF(CURDATE(), created_at) AS days_unsold FROM Product WHERE store_id = ? AND DATEDIFF(CURDATE(), created_at) > 30`, [supplierId]);
+    const highProfit = await queryDB(`SELECT id, title, ROUND((supplier_sold_price - supplier_purchase_price)/supplier_sold_price*100,2) AS margin_percent FROM Product WHERE store_id = ? HAVING margin_percent >= 40`, [supplierId]);
 
-    // Out of stock
-    const [outOfStock] = await pool.query(
-      `SELECT id, title 
-       FROM Product 
-       WHERE store_id = ? AND stock_quantity = 0`,
-      [supplierId]
-    );
-
-    // Aging inventory > 30 days
-    const [agingInventory] = await pool.query(
-      `SELECT id, title, DATEDIFF(CURDATE(), created_at) AS days_unsold
-       FROM Product
-       WHERE store_id = ? AND DATEDIFF(CURDATE(), created_at) > 30`,
-      [supplierId]
-    );
-
-    // High margin products (>40%)
-    const [highProfit] = await pool.query(
-      `SELECT id, title,
-              CASE
-                WHEN supplier_sold_price IS NOT NULL AND supplier_sold_price > 0
-                THEN ROUND((supplier_sold_price - supplier_purchase_price)/supplier_sold_price*100,2)
-                ELSE 0
-              END AS margin_percent
-       FROM Product
-       WHERE store_id = ?
-       HAVING margin_percent >= 40`,
-      [supplierId]
-    );
-
-    console.log(`✅ Alerts: ${lowStock.length} low stock, ${agingInventory.length} aging`);
-    res.json({ 
-      low_stock: lowStock,
-      out_of_stock: outOfStock,
-      aging_inventory: agingInventory, 
-      high_profit: highProfit 
-    });
+    res.json({ low_stock: lowStock, out_of_stock: outOfStock, aging_inventory: agingInventory, high_profit: highProfit });
   } catch (err) {
-    console.error("❌ Alerts Error:", err);
     res.status(500).json({ message: "Server error", error: err.message });
   }
 });
@@ -429,31 +313,22 @@ router.get("/alerts", verifyToken, async (req, res) => {
 router.get("/heatmap", verifyToken, async (req, res) => {
   const userId = req.user.userId;
   const period = parseInt(req.query.period) || 30;
-
   try {
-    console.log("🗓️ Fetching heatmap for user_id:", userId);
-
     const supplierId = await getSupplierProfileId(userId);
-    if (!supplierId) {
-      return res.status(404).json({ success: false, message: "Supplier profile not found" });
-    }
+    if (!supplierId) return res.status(404).json({ success: false, message: "Supplier profile not found" });
 
-    // Daily sales by weekday
-    const [daily] = await pool.query(
-      `SELECT DATE_FORMAT(ps.sale_date, '%W') AS day, 
-              SUM(ps.total_sale_amount) AS total_sales
+    const daily = await queryDB(
+      `SELECT DATE_FORMAT(ps.sale_date, '%W') AS day, SUM(ps.total_sale_amount) AS total_sales
        FROM ProductSales ps
        JOIN Product p ON ps.product_id = p.id
        WHERE p.store_id = ? AND ps.sale_date >= DATE_SUB(CURDATE(), INTERVAL ? DAY)
        GROUP BY day
-       ORDER BY FIELD(day, 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday')`,
+       ORDER BY FIELD(day, 'Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday')`,
       [supplierId, period]
     );
 
-    // Hourly sales
-    const [hourly] = await pool.query(
-      `SELECT HOUR(ps.sale_date) AS hour, 
-              SUM(ps.total_sale_amount) AS total_sales
+    const hourly = await queryDB(
+      `SELECT HOUR(ps.sale_date) AS hour, SUM(ps.total_sale_amount) AS total_sales
        FROM ProductSales ps
        JOIN Product p ON ps.product_id = p.id
        WHERE p.store_id = ? AND ps.sale_date >= DATE_SUB(CURDATE(), INTERVAL ? DAY)
@@ -462,10 +337,8 @@ router.get("/heatmap", verifyToken, async (req, res) => {
       [supplierId, period]
     );
 
-    console.log(`✅ Heatmap: ${daily.length} days, ${hourly.length} hours`);
     res.json({ daily_sales: daily, hourly_sales: hourly });
   } catch (err) {
-    console.error("❌ Heatmap Error:", err);
     res.status(500).json({ message: "Server error", error: err.message });
   }
 });
@@ -478,40 +351,28 @@ router.get("/export", verifyToken, async (req, res) => {
   const { start, end, type = "json" } = req.query;
 
   try {
-    console.log("📤 Exporting data for user_id:", userId);
-
     const supplierId = await getSupplierProfileId(userId);
-    if (!supplierId) {
-      return res.status(404).json({ success: false, message: "Supplier profile not found" });
-    }
+    if (!supplierId) return res.status(404).json({ success: false, message: "Supplier profile not found" });
 
-    const [kpis] = await pool.query(
-      `SELECT 
-         IFNULL(SUM(p.supplier_purchase_price * ps.quantity_sold), 0) AS total_investment,
-         IFNULL(SUM(ps.total_sale_amount), 0) AS total_sales_value,
-         IFNULL(SUM(ps.profit), 0) AS total_profit
+    const kpis = await queryDB(
+      `SELECT IFNULL(SUM(p.supplier_purchase_price * ps.quantity_sold),0) AS total_investment,
+              IFNULL(SUM(ps.total_sale_amount),0) AS total_sales_value,
+              IFNULL(SUM(ps.profit),0) AS total_profit
        FROM Product p
        LEFT JOIN ProductSales ps ON p.id = ps.product_id
-       WHERE p.store_id = ? 
-         AND ps.sale_date BETWEEN ? AND ?`,
+       WHERE p.store_id = ? AND ps.sale_date BETWEEN ? AND ?`,
       [supplierId, start, end]
     );
 
-    const [products] = await pool.query(
+    const products = await queryDB(
       `SELECT id, title, stock_quantity, supplier_purchase_price, supplier_sold_price
-       FROM Product
-       WHERE store_id = ?`,
+       FROM Product WHERE store_id = ?`,
       [supplierId]
     );
 
-    if (type === "json") {
-      console.log("✅ Export completed");
-      return res.json({ kpis: kpis[0], products });
-    } else {
-      return res.status(400).json({ message: "Only JSON export supported now" });
-    }
+    if (type === "json") return res.json({ kpis: kpis[0], products });
+    res.status(400).json({ message: "Only JSON export supported now" });
   } catch (err) {
-    console.error("❌ Export Error:", err);
     res.status(500).json({ message: "Server error", error: err.message });
   }
 });

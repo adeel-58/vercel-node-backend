@@ -1,35 +1,172 @@
 // api/product.js
 import express from "express";
-import pool from "../db.js";
 import multer from "multer";
 import path from "path";
 import fs from "fs";
 import jwt from "jsonwebtoken";
 import FTPClient from "basic-ftp";
+import queryDB from "../db.js";
 
 const router = express.Router();
 const JWT_SECRET = process.env.JWT_SECRET || "your-secret-key-change-in-production";
+
 const FTP_HOST = process.env.FTP_HOST;
 const FTP_USER = process.env.FTP_USER;
 const FTP_PASS = process.env.FTP_PASSWORD;
-const FTP_PORT = process.env.FTP_PORT || 21;
-const FTP_BASE_PATH = process.env.FTP_BASE_PATH || "/public_html/uploads/products";
+const FTP_PORT = process.env.FTP_PORT ? Number(process.env.FTP_PORT) : 21;
+// Prefer not to include public_html in default path; keep it consistent with other files
+const FTP_BASE_PATH = process.env.FTP_BASE_PATH || "/uploads/products";
+const FTP_PUBLIC_URL = process.env.FTP_PUBLIC_URL || "https://storensupply.com/uploads/products";
 
-// ------------------ Multer Setup (Temp Storage) ------------------
+// ------------------ Helpers ------------------
+
+const handleDBError = (res, err) => {
+  console.error("Database error:", err);
+  if (err && err.code === "ETIMEDOUT") {
+    return res.status(503).json({
+      success: false,
+      message: "Database timeout. Please try again shortly.",
+      error: err.message,
+    });
+  }
+  return res.status(500).json({
+    success: false,
+    message: "Database error",
+    error: err.message || err,
+  });
+};
+
+const removeLocalFileSafe = (filePath) => {
+  try {
+    if (filePath && fs.existsSync(filePath)) fs.unlinkSync(filePath);
+  } catch (e) {
+    console.warn("Failed to remove temp file:", filePath, e.message);
+  }
+};
+
+const normalizeRemotePath = (p) => {
+  if (!p) return p;
+  // ensure leading slash
+  return p.startsWith("/") ? p : `/${p}`;
+};
+
+const buildPublicUrl = (remotePath) => {
+  if (!remotePath) return null;
+  try {
+    // remove leading slashes
+    const p = remotePath.replace(/^\/+/, "");
+    const parts = p.split("/").filter(Boolean);
+    const uploadsIndex = parts.findIndex((x) => x.toLowerCase() === "uploads");
+    if (uploadsIndex >= 0) {
+      const afterUploads = parts.slice(uploadsIndex + 1); // ["products","<storeId>","file.jpg"]
+      // If first segment after uploads is products, remove it to avoid double
+      if (afterUploads[0] && afterUploads[0].toLowerCase() === "products") {
+        const relative = afterUploads.slice(1).join("/");
+        return `${FTP_PUBLIC_URL}/${relative}`;
+      } else {
+        return `${FTP_PUBLIC_URL}/${afterUploads.join("/")}`;
+      }
+    }
+    return `${FTP_PUBLIC_URL}/${path.basename(remotePath)}`;
+  } catch (err) {
+    console.warn("buildPublicUrl failed:", err);
+    return `${FTP_PUBLIC_URL}/${path.basename(remotePath)}`;
+  }
+};
+
+// ------------------ FTP Helpers ------------------
+
+const ftpAccessConfig = () => ({
+  host: FTP_HOST,
+  user: FTP_USER,
+  password: FTP_PASS,
+  port: FTP_PORT,
+  secure: false,
+});
+
+const uploadToFTP = async (localFilePath, remoteFolder) => {
+  const client = new FTPClient.Client();
+  client.ftp.verbose = false;
+  try {
+    await client.access(ftpAccessConfig());
+    await client.ensureDir(remoteFolder);
+    await client.uploadFrom(localFilePath, path.basename(localFilePath));
+    const remote = normalizeRemotePath(path.posix.join(remoteFolder, path.basename(localFilePath)));
+    return remote;
+  } catch (err) {
+    console.error("FTP Upload Error:", err);
+    throw new Error("FTP upload failed: " + (err.message || err));
+  } finally {
+    client.close();
+  }
+};
+
+const deleteFromFTP = async (remoteFilePath) => {
+  if (!remoteFilePath) return false;
+  const client = new FTPClient.Client();
+  client.ftp.verbose = false;
+  try {
+    await client.access(ftpAccessConfig());
+    const cleaned = remoteFilePath.replace(/^\/+/, "");
+    try {
+      await client.remove(cleaned);
+      return true;
+    } catch (err) {
+      // try without public_html
+      try {
+        const alt = cleaned.replace(/^public_html\/?/i, "");
+        await client.remove(alt);
+        return true;
+      } catch (err2) {
+        // try basename
+        try {
+          await client.remove(path.basename(cleaned));
+          return true;
+        } catch (err3) {
+          console.warn("FTP delete attempts failed:", err.message, err2?.message, err3?.message);
+          return false;
+        }
+      }
+    }
+  } catch (err) {
+    console.warn("FTP Delete Error (non-fatal):", err.message || err);
+    return false;
+  } finally {
+    client.close();
+  }
+};
+
+// ------------------ Multer Setup (Temp Storage, 2MB limit) ------------------
+
+const MAX_FILE_BYTES = 2 * 1024 * 1024; // 2 MB
+
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
-    const tempPath = "temp_uploads";
+    const tempPath = path.join(process.cwd(), "temp_uploads");
     if (!fs.existsSync(tempPath)) fs.mkdirSync(tempPath, { recursive: true });
     cb(null, tempPath);
   },
   filename: (req, file, cb) => {
     const uniqueSuffix = Date.now() + "-" + Math.round(Math.random() * 1e9);
-    cb(null, uniqueSuffix + path.extname(file.originalname));
+    cb(null, `${uniqueSuffix}${path.extname(file.originalname)}`);
   },
 });
-const upload = multer({ storage });
+
+const upload = multer({
+  storage,
+  limits: { fileSize: MAX_FILE_BYTES },
+  fileFilter: (req, file, cb) => {
+    // allow common image mime types only
+    if (/^image\/(jpeg|png|webp|gif|jpg)$/.test(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error("Only image files (jpeg, png, webp, gif) are allowed"));
+    }
+  },
+});
 
 // ------------------ Auth Middleware ------------------
+
 export const verifyToken = (req, res, next) => {
   try {
     const authHeader = req.headers.authorization;
@@ -43,77 +180,61 @@ export const verifyToken = (req, res, next) => {
       next();
     });
   } catch (error) {
+    console.error("Token verify error:", error);
     return res.status(500).json({ success: false, message: "Server error during token verification" });
-  }
-};
-
-// ------------------ FTP Upload Helper ------------------
-const uploadToFTP = async (localFilePath, remoteFolder) => {
-  const client = new FTPClient.Client();
-  client.ftp.verbose = false;
-  try {
-    await client.access({
-      host: FTP_HOST,
-      user: FTP_USER,
-      password: FTP_PASS,
-      port: FTP_PORT,
-    });
-
-    // Ensure remote folder exists
-    await client.ensureDir(remoteFolder);
-    await client.uploadFrom(localFilePath, path.basename(localFilePath));
-
-    return `${remoteFolder}/${path.basename(localFilePath)}`;
-  } catch (err) {
-    console.error("FTP Upload Error:", err);
-    throw new Error("FTP upload failed");
-  } finally {
-    client.close();
   }
 };
 
 // ------------------ Routes ------------------
 
-// POST /product/add
+/**
+ * POST /product/add
+ * - Uploads main_image and other_images to FTP, inserts Product + ProductImage rows.
+ */
 router.post(
   "/add",
   verifyToken,
   upload.fields([{ name: "main_image", maxCount: 1 }, { name: "other_images", maxCount: 5 }]),
   async (req, res) => {
-    const connection = pool;
-
     try {
       const supplierUserId = req.user.userId;
 
-      // 1️⃣ Get supplier profile
-      const [supplierRows] = await connection.query(
-        `SELECT id, plan_id FROM SupplierProfile WHERE user_id = ?`,
+      // 1) Get supplier profile
+      const suppliers = await queryDB(
+        `SELECT id, plan_id FROM SupplierProfile WHERE user_id = ? LIMIT 1`,
         [supplierUserId]
       );
-      if (supplierRows.length === 0)
+      if (!suppliers || suppliers.length === 0) {
+        // cleanup temp files
+        removeLocalFileSafe(req.files?.main_image?.[0]?.path);
+        (req.files?.other_images || []).forEach(f => removeLocalFileSafe(f.path));
         return res.status(400).json({ success: false, message: "Supplier profile not found" });
+      }
+      const storeId = suppliers[0].id;
+      const planId = suppliers[0].plan_id;
 
-      const storeId = supplierRows[0].id;
-
-      // 2️⃣ Check plan & limits
-      const [planRows] = await connection.query(
-        `SELECT name, upload_limit FROM Plan WHERE id = ? AND is_active = 1`,
-        [supplierRows[0].plan_id]
-      );
-      if (planRows.length === 0)
+      // 2) Check plan & limits
+      const plans = await queryDB(`SELECT name, upload_limit FROM Plan WHERE id = ? AND is_active = 1 LIMIT 1`, [planId]);
+      if (!plans || plans.length === 0) {
+        removeLocalFileSafe(req.files?.main_image?.[0]?.path);
+        (req.files?.other_images || []).forEach(f => removeLocalFileSafe(f.path));
         return res.status(403).json({ success: false, message: "Plan inactive or invalid" });
+      }
+      const plan = plans[0];
 
-      const [productCountRows] = await connection.query(
-        `SELECT COUNT(*) AS total FROM Product WHERE store_id = ?`,
-        [storeId]
-      );
-      if (productCountRows[0].total >= planRows[0].upload_limit)
+      const productCountRows = await queryDB(`SELECT COUNT(*) AS total FROM Product WHERE store_id = ?`, [storeId]);
+      const currentCount = (productCountRows && productCountRows[0] && Number(productCountRows[0].total)) || 0;
+
+      if (typeof plan.upload_limit === "number" && plan.upload_limit >= 0 && currentCount >= plan.upload_limit) {
+        removeLocalFileSafe(req.files?.main_image?.[0]?.path);
+        (req.files?.other_images || []).forEach(f => removeLocalFileSafe(f.path));
         return res.status(403).json({
           success: false,
-          message: `Upload limit reached for plan ${planRows[0].name}`,
+          message: `Upload limit reached for plan ${plan.name}`,
         });
+      }
 
-      // 3️⃣ Prepare product data
+      // 3) Prepare product data from body
       const {
         title,
         ebay_link,
@@ -126,214 +247,160 @@ router.post(
         status,
       } = req.body;
 
-      // 4️⃣ Upload images via FTP
-      const mainImageFile = req.files["main_image"]?.[0];
-      const otherImageFiles = req.files["other_images"] || [];
+      // 4) FTP upload main image and other images
+      const mainImageFile = req.files?.main_image?.[0];
+      const otherImageFiles = req.files?.other_images || [];
 
       let mainImagePath = null;
       const otherImagesPaths = [];
 
-      if (mainImageFile) {
-        mainImagePath = await uploadToFTP(mainImageFile.path, `${FTP_BASE_PATH}/${storeId}`);
-        fs.unlinkSync(mainImageFile.path);
+      try {
+        if (mainImageFile) {
+          mainImagePath = await uploadToFTP(mainImageFile.path, path.posix.join(FTP_BASE_PATH, String(storeId)));
+        }
+
+        for (const file of otherImageFiles) {
+          const remote = await uploadToFTP(file.path, path.posix.join(FTP_BASE_PATH, String(storeId)));
+          otherImagesPaths.push(remote);
+        }
+      } catch (ftpErr) {
+        // Clean up local files
+        removeLocalFileSafe(mainImageFile?.path);
+        (otherImageFiles || []).forEach(f => removeLocalFileSafe(f.path));
+        console.error("FTP upload failed during product add:", ftpErr);
+        return res.status(500).json({ success: false, message: "Image upload failed", error: ftpErr.message || ftpErr });
+      } finally {
+        // Remove local temps (successful or not)
+        removeLocalFileSafe(mainImageFile?.path);
+        (otherImageFiles || []).forEach(f => removeLocalFileSafe(f.path));
       }
 
-      for (const file of otherImageFiles) {
-        const remotePath = await uploadToFTP(file.path, `${FTP_BASE_PATH}/${storeId}`);
-        otherImagesPaths.push(remotePath);
-        fs.unlinkSync(file.path);
-      }
-
-      // 5️⃣ Insert Product
-      const [result] = await connection.query(
+      // 5) Insert product
+      const insertResult = await queryDB(
         `INSERT INTO Product 
-        (store_id, ebay_link, title, country, main_image, supplier_purchase_price,
-          supplier_sold_price, stock_quantity, status, source_type, category)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          (store_id, ebay_link, title, country, main_image, supplier_purchase_price,
+           supplier_sold_price, stock_quantity, status, source_type, category, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
         [
           storeId,
           ebay_link || null,
-          title,
+          title || null,
           country || null,
-          mainImagePath,
-          supplier_purchase_price,
+          mainImagePath ? normalizeRemotePath(mainImagePath) : null,
+          supplier_purchase_price || null,
           supplier_sold_price || null,
-          stock_quantity || 0,
+          stock_quantity ? Number(stock_quantity) : 0,
           status || "active",
           source_type || "manual",
           category || null,
         ]
       );
 
-      const productId = result.insertId;
+      const productId = insertResult && insertResult.insertId ? insertResult.insertId : null;
 
-      // 6️⃣ Insert other images
-      if (otherImagesPaths.length > 0) {
-        const values = otherImagesPaths.map((p) => [productId, p, false]);
-        await connection.query(`INSERT INTO ProductImage (product_id, image_url, is_primary) VALUES ?`, [values]);
+      // 6) Insert other images into ProductImage
+      if (productId && otherImagesPaths.length > 0) {
+        // Build multi-row insert
+        const placeholders = otherImagesPaths.map(() => "(?, ?, ?)").join(", ");
+        const params = [];
+        for (const pth of otherImagesPaths) {
+          params.push(productId, normalizeRemotePath(pth), 0);
+        }
+        const sql = `INSERT INTO ProductImage (product_id, image_url, is_primary) VALUES ${placeholders}`;
+        await queryDB(sql, params);
       }
 
-      // 7️⃣ Update supplier product count
-      await connection.query(`UPDATE SupplierProfile SET total_products = total_products + 1 WHERE id = ?`, [storeId]);
+      // 7) Update supplier product count (safe)
+      try {
+        await queryDB(`UPDATE SupplierProfile SET total_products = COALESCE(total_products,0) + 1 WHERE id = ?`, [storeId]);
+      } catch (e) {
+        console.warn("Failed to increment supplier total_products (non-fatal):", e.message || e);
+      }
 
-      res.json({ success: true, message: "Product added successfully", product_id: productId });
+      return res.json({ success: true, message: "Product added successfully", product_id: productId });
     } catch (err) {
       console.error("❌ Add Product Error:", err);
-      return res.status(500).json({ success: false, message: "Failed to add product", error: err.message });
+      // attempt to remove any temp files still present
+      removeLocalFileSafe(req.files?.main_image?.[0]?.path);
+      (req.files?.other_images || []).forEach(f => removeLocalFileSafe(f.path));
+      return handleDBError(res, err);
     }
   }
-);// GET /product  -> get all products for current supplier
-// GET /product  -> get all products for current supplier with optional status filter
+);
+
+// GET /product -> get all products for current supplier with optional status filter
 router.get("/", verifyToken, async (req, res) => {
   try {
     const statusFilter = req.query.status; // optional "active" or "paused"
 
-    const [supplier] = await pool.query(
-      `SELECT id FROM SupplierProfile WHERE user_id = ?`,
-      [req.user.userId]
-    );
-    if (supplier.length === 0)
+    const supplierRows = await queryDB(`SELECT id FROM SupplierProfile WHERE user_id = ? LIMIT 1`, [req.user.userId]);
+    if (!supplierRows || supplierRows.length === 0)
       return res.status(400).json({ success: false, message: "Supplier profile not found" });
 
-    const storeId = supplier[0].id;
+    const storeId = supplierRows[0].id;
 
     let sql = `SELECT * FROM Product WHERE store_id = ?`;
     const params = [storeId];
     if (statusFilter && ["active", "paused"].includes(statusFilter)) {
+      // map 'paused' => 'out_of_stock' if needed by DB; original code used 'paused' but DB had statuses
+      const mapped = statusFilter === "paused" ? "out_of_stock" : statusFilter;
       sql += ` AND status = ?`;
-      params.push(statusFilter);
+      params.push(mapped);
     }
     sql += ` ORDER BY created_at DESC`;
 
-    const [products] = await pool.query(sql, params);
+    const products = await queryDB(sql, params);
 
-    if (products.length === 0) return res.json({ success: true, products: [] });
+    if (!products || products.length === 0) return res.json({ success: true, products: [] });
 
     const productIds = products.map((p) => p.id);
-    const [images] = await pool.query(
-      `SELECT * FROM ProductImage WHERE product_id IN (?)`,
-      [productIds]
-    );
 
-    // Use your public domain for images
-    const FTP_PUBLIC_URL = "https://storensupply.com/uploads/products";
+    // fetch images for these products
+    const images = await queryDB(`SELECT * FROM ProductImage WHERE product_id IN (?)`, [productIds]);
 
     const productsWithImages = products.map((p) => {
-      const imgs = images
+      const imgs = (images || [])
         .filter((img) => img.product_id === p.id)
-        .map((img) => ({
-          ...img,
-          image_url: `${FTP_PUBLIC_URL}/${img.image_url.split("/").slice(-2).join("/")}` // folder + filename
-        }));
-
-      const mainImageUrl = p.main_image
-        ? `${FTP_PUBLIC_URL}/${p.main_image.split("/").slice(-2).join("/")}`
-        : null;
-
-      return {
-        ...p,
-        main_image: mainImageUrl,
-        images: imgs,
-      };
+        .map((img) => ({ ...img, image_url: buildPublicUrl(img.image_url) }));
+      const mainImageUrl = p.main_image ? buildPublicUrl(p.main_image) : null;
+      return { ...p, main_image: mainImageUrl, images: imgs };
     });
 
-    res.json({ success: true, products: productsWithImages });
+    return res.json({ success: true, products: productsWithImages });
   } catch (err) {
     console.error("❌ Fetch Products Error:", err);
-    res.status(500).json({
-      success: false,
-      message: "Failed to fetch products",
-      error: err.message,
-    });
+    return handleDBError(res, err);
   }
 });
-// ------------------ FTP Delete Helper ------------------
-const deleteFromFTP = async (remoteFilePath) => {
-  // remoteFilePath should be a full remote path like: `${FTP_BASE_PATH}/${storeId}/${filename}`
-  const client = new FTPClient.Client();
-  client.ftp.verbose = false;
-  try {
-    await client.access({
-      host: FTP_HOST,
-      user: FTP_USER,
-      password: FTP_PASS,
-      port: FTP_PORT,
-    });
 
-    // If the stored path includes the FTP_BASE_PATH, use it as-is.
-    // basic-ftp expects a remote path relative to the FTP root.
-    // Example remoteFilePath: /public_html/uploads/products/17/12345.jpg
-    // But on some hosts the FTP root is already /public_html. If deletion fails, try removing leading /public_html.
-    try {
-      await client.remove(remoteFilePath);
-      return true;
-    } catch (err) {
-      // Try without /public_html prefix if present
-      const alt = remoteFilePath.replace(/^\/?public_html\/?/i, "/");
-      await client.remove(alt);
-      return true;
-    }
-  } catch (err) {
-    console.error("FTP Delete Error:", err);
-    throw new Error("FTP delete failed");
-  } finally {
-    client.close();
-  }
-};
-
-// Helper to build public URL from stored remote path
-const buildPublicUrl = (remotePath) => {
-  // remotePath is like: /public_html/uploads/products/<storeId>/<file>
-  // We want: https://storensupply.com/uploads/products/<storeId>/<file>
-  const FTP_PUBLIC_URL = process.env.FTP_PUBLIC_URL || "https://storensupply.com/uploads/products";
-  // extract <storeId>/<file> part
-  const parts = remotePath.split("/").filter(Boolean); // remove empty
-  // find index of "uploads" in parts
-  const uploadsIndex = parts.findIndex((p) => p.toLowerCase() === "uploads");
-  if (uploadsIndex >= 0) {
-    const rel = parts.slice(uploadsIndex + 2).length ? parts.slice(uploadsIndex + 1).join("/") : parts.slice(uploadsIndex + 1).join("/");
-    // If parts are ["public_html","uploads","products","17","file.jpg"] => rel = "products/17/file.jpg"
-    // We expect FTP_PUBLIC_URL already points to /uploads/products so join last two segments if needed
-    const afterUploads = parts.slice(uploadsIndex + 1); // ["products","17","file.jpg"]
-    return `${FTP_PUBLIC_URL}/${afterUploads.slice(1).join("/")}`; // remove "products" because FTP_PUBLIC_URL already includes it
-  }
-  // fallback — return FTP_PUBLIC_URL + basename
-  return `${FTP_PUBLIC_URL}/${path.basename(remotePath)}`;
-};
-
-// ------------------ GET single product (owner) ------------------
+// GET /product/:id -> get single product (owner)
 router.get("/:id", verifyToken, async (req, res) => {
   try {
     const { id } = req.params;
     const userId = req.user.userId;
 
-    // Validate supplier ownership
-    const [supplierRows] = await pool.query(`SELECT id FROM SupplierProfile WHERE user_id = ?`, [userId]);
-    if (supplierRows.length === 0) return res.status(404).json({ success: false, message: "Supplier not found" });
+    const supplierRows = await queryDB(`SELECT id FROM SupplierProfile WHERE user_id = ? LIMIT 1`, [userId]);
+    if (!supplierRows || supplierRows.length === 0)
+      return res.status(404).json({ success: false, message: "Supplier not found" });
     const storeId = supplierRows[0].id;
 
-    // Fetch product
-    const [rows] = await pool.query(`SELECT * FROM Product WHERE id = ? AND store_id = ?`, [id, storeId]);
-    if (rows.length === 0) return res.status(404).json({ success: false, message: "Product not found" });
+    const rows = await queryDB(`SELECT * FROM Product WHERE id = ? AND store_id = ? LIMIT 1`, [id, storeId]);
+    if (!rows || rows.length === 0) return res.status(404).json({ success: false, message: "Product not found" });
     const product = rows[0];
 
-    // Fetch product images
-    const [images] = await pool.query(`SELECT * FROM ProductImage WHERE product_id = ? ORDER BY is_primary DESC, id ASC`, [id]);
+    const images = await queryDB(`SELECT * FROM ProductImage WHERE product_id = ? ORDER BY is_primary DESC, id ASC`, [id]);
 
-    // Build public URLs
     const mainImageUrl = product.main_image ? buildPublicUrl(product.main_image) : null;
-    const imgs = images.map((img) => ({ ...img, image_url: buildPublicUrl(img.image_url) }));
+    const imgs = (images || []).map((img) => ({ ...img, image_url: buildPublicUrl(img.image_url) }));
 
-    res.json({ success: true, product: { ...product, main_image: mainImageUrl, images: imgs } });
+    return res.json({ success: true, product: { ...product, main_image: mainImageUrl, images: imgs } });
   } catch (err) {
     console.error("❌ GET single product error:", err);
-    res.status(500).json({ success: false, message: "Failed to fetch product", error: err.message });
+    return handleDBError(res, err);
   }
 });
 
-// ------------------ PUT /product/:id -> Edit product ------------------
-// Supports optional main_image replacement and adding other_images.
-// If main image is replaced, old remote file will be deleted.
+// PUT /product/:id -> Edit product (replace main image / add gallery images)
 router.put(
   "/:id",
   verifyToken,
@@ -343,17 +410,23 @@ router.put(
     const userId = req.user.userId;
 
     try {
-      // Check supplier ownership
-      const [supplierRows] = await pool.query(`SELECT id FROM SupplierProfile WHERE user_id = ?`, [userId]);
-      if (supplierRows.length === 0) return res.status(404).json({ success: false, message: "Supplier not found" });
+      const supplierRows = await queryDB(`SELECT id FROM SupplierProfile WHERE user_id = ? LIMIT 1`, [userId]);
+      if (!supplierRows || supplierRows.length === 0) {
+        removeLocalFileSafe(req.files?.main_image?.[0]?.path);
+        (req.files?.other_images || []).forEach(f => removeLocalFileSafe(f.path));
+        return res.status(404).json({ success: false, message: "Supplier not found" });
+      }
       const storeId = supplierRows[0].id;
 
-      // Check product belongs to supplier
-      const [prodRows] = await pool.query(`SELECT * FROM Product WHERE id = ? AND store_id = ?`, [id, storeId]);
-      if (prodRows.length === 0) return res.status(404).json({ success: false, message: "Product not found" });
+      const prodRows = await queryDB(`SELECT * FROM Product WHERE id = ? AND store_id = ? LIMIT 1`, [id, storeId]);
+      if (!prodRows || prodRows.length === 0) {
+        removeLocalFileSafe(req.files?.main_image?.[0]?.path);
+        (req.files?.other_images || []).forEach(f => removeLocalFileSafe(f.path));
+        return res.status(404).json({ success: false, message: "Product not found" });
+      }
       const product = prodRows[0];
 
-      // Fields to update
+      // fields to update
       const fields = ["title", "ebay_link", "supplier_purchase_price", "supplier_sold_price", "stock_quantity", "category", "country", "source_type", "status"];
       const updates = [];
       const params = [];
@@ -365,165 +438,167 @@ router.put(
         }
       });
 
-      // Handle main image replacement (optional)
+      // main image replacement
       if (req.files && req.files["main_image"] && req.files["main_image"][0]) {
         const newFile = req.files["main_image"][0];
-        // Upload new image to FTP
-        const remotePath = await uploadToFTP(newFile.path, `${FTP_BASE_PATH}/${storeId}`);
-        // Delete temp file
-        try { fs.unlinkSync(newFile.path); } catch (e) {}
-        // Delete old main image from FTP (if exists)
-        if (product.main_image) {
-          try { await deleteFromFTP(product.main_image); } catch (e) { console.warn("Failed to delete old main image:", e.message); }
+        try {
+          const remotePath = await uploadToFTP(newFile.path, path.posix.join(FTP_BASE_PATH, String(storeId)));
+          // cleanup local
+          removeLocalFileSafe(newFile.path);
+          // delete old remote main image (non-fatal)
+          if (product.main_image) {
+            try { await deleteFromFTP(product.main_image); } catch (e) { console.warn("Failed to delete old main image:", e.message || e); }
+          }
+          updates.push("main_image = ?");
+          params.push(normalizeRemotePath(remotePath));
+        } catch (uploadErr) {
+          removeLocalFileSafe(newFile.path);
+          console.error("Main image upload failed:", uploadErr);
+          return res.status(500).json({ success: false, message: "Main image upload failed", error: uploadErr.message || uploadErr });
         }
-        updates.push("main_image = ?");
-        params.push(remotePath);
       }
 
-      // Apply update query if any fields changed
+      // apply update if necessary
       if (updates.length > 0) {
         params.push(id);
-        await pool.query(`UPDATE Product SET ${updates.join(", ")} WHERE id = ?`, params);
+        const sql = `UPDATE Product SET ${updates.join(", ")}, updated_at = NOW() WHERE id = ?`;
+        await queryDB(sql, params);
       }
 
-      // Handle new gallery images appended
+      // append other images if provided
       if (req.files && req.files["other_images"] && req.files["other_images"].length > 0) {
-        const newImages = req.files["other_images"];
         const insertValues = [];
-        for (const file of newImages) {
-          const remote = await uploadToFTP(file.path, `${FTP_BASE_PATH}/${storeId}`);
-          try { fs.unlinkSync(file.path); } catch (e) {}
-          insertValues.push([id, remote, false]);
+        for (const file of req.files["other_images"]) {
+          try {
+            const remote = await uploadToFTP(file.path, path.posix.join(FTP_BASE_PATH, String(storeId)));
+            insertValues.push([id, normalizeRemotePath(remote), 0]);
+          } catch (uploadErr) {
+            console.error("Gallery image upload failed:", uploadErr);
+            // cleanup the failed file and continue with other files
+          } finally {
+            removeLocalFileSafe(file.path);
+          }
         }
         if (insertValues.length > 0) {
-          await pool.query(`INSERT INTO ProductImage (product_id, image_url, is_primary) VALUES ?`, [insertValues]);
+          // construct bulk insert
+          const placeholders = insertValues.map(() => "(?, ?, ?)").join(", ");
+          const flattened = insertValues.flat();
+          const sql = `INSERT INTO ProductImage (product_id, image_url, is_primary) VALUES ${placeholders}`;
+          await queryDB(sql, flattened);
         }
       }
 
-      res.json({ success: true, message: "Product updated successfully" });
+      return res.json({ success: true, message: "Product updated successfully" });
     } catch (err) {
       console.error("❌ Edit product error:", err);
-      res.status(500).json({ success: false, message: "Failed to update product", error: err.message });
+      removeLocalFileSafe(req.files?.main_image?.[0]?.path);
+      (req.files?.other_images || []).forEach(f => removeLocalFileSafe(f.path));
+      return handleDBError(res, err);
     }
   }
 );
 
-// ------------------ DELETE /product/:id/image/:imageId -> Delete single gallery image ------------------
+// DELETE single gallery image
 router.delete("/:id/image/:imageId", verifyToken, async (req, res) => {
   try {
     const { id, imageId } = req.params;
     const userId = req.user.userId;
 
-    // Check owner
-    const [supplierRows] = await pool.query(`SELECT id FROM SupplierProfile WHERE user_id = ?`, [userId]);
-    if (supplierRows.length === 0) return res.status(404).json({ success: false, message: "Supplier not found" });
+    const supplierRows = await queryDB(`SELECT id FROM SupplierProfile WHERE user_id = ? LIMIT 1`, [userId]);
+    if (!supplierRows || supplierRows.length === 0)
+      return res.status(404).json({ success: false, message: "Supplier not found" });
     const storeId = supplierRows[0].id;
 
-    // Verify image belongs to product and product belongs to supplier
-    const [prodRows] = await pool.query(`SELECT * FROM Product WHERE id = ? AND store_id = ?`, [id, storeId]);
-    if (prodRows.length === 0) return res.status(404).json({ success: false, message: "Product not found" });
+    const prodRows = await queryDB(`SELECT * FROM Product WHERE id = ? AND store_id = ? LIMIT 1`, [id, storeId]);
+    if (!prodRows || prodRows.length === 0) return res.status(404).json({ success: false, message: "Product not found" });
 
-    const [imgRows] = await pool.query(`SELECT * FROM ProductImage WHERE id = ? AND product_id = ?`, [imageId, id]);
-    if (imgRows.length === 0) return res.status(404).json({ success: false, message: "Image not found" });
+    const imgRows = await queryDB(`SELECT * FROM ProductImage WHERE id = ? AND product_id = ? LIMIT 1`, [imageId, id]);
+    if (!imgRows || imgRows.length === 0) return res.status(404).json({ success: false, message: "Image not found" });
 
     const img = imgRows[0];
-
-    // Delete remote file
     try {
       await deleteFromFTP(img.image_url);
     } catch (err) {
-      console.warn("FTP delete failed for image:", img.image_url, err.message);
-      // continue to remove DB row even if file deletion failed
+      console.warn("FTP delete failed for image (non-fatal):", img.image_url, err.message || err);
     }
 
-    // Remove DB row
-    await pool.query(`DELETE FROM ProductImage WHERE id = ?`, [imageId]);
+    await queryDB(`DELETE FROM ProductImage WHERE id = ?`, [imageId]);
 
-    res.json({ success: true, message: "Image deleted successfully" });
+    return res.json({ success: true, message: "Image deleted successfully" });
   } catch (err) {
     console.error("❌ Delete image error:", err);
-    res.status(500).json({ success: false, message: "Failed to delete image", error: err.message });
+    return handleDBError(res, err);
   }
 });
 
-// ------------------ DELETE /product/:id -> Delete product + images ------------------
+// DELETE product + images
 router.delete("/:id", verifyToken, async (req, res) => {
   try {
     const { id } = req.params;
     const userId = req.user.userId;
 
-    // Check owner
-    const [supplierRows] = await pool.query(`SELECT id FROM SupplierProfile WHERE user_id = ?`, [userId]);
-    if (supplierRows.length === 0) return res.status(404).json({ success: false, message: "Supplier not found" });
+    const supplierRows = await queryDB(`SELECT id FROM SupplierProfile WHERE user_id = ? LIMIT 1`, [userId]);
+    if (!supplierRows || supplierRows.length === 0) return res.status(404).json({ success: false, message: "Supplier not found" });
     const storeId = supplierRows[0].id;
 
-    // Verify product
-    const [prodRows] = await pool.query(`SELECT * FROM Product WHERE id = ? AND store_id = ?`, [id, storeId]);
-    if (prodRows.length === 0) return res.status(404).json({ success: false, message: "Product not found" });
+    const prodRows = await queryDB(`SELECT * FROM Product WHERE id = ? AND store_id = ? LIMIT 1`, [id, storeId]);
+    if (!prodRows || prodRows.length === 0) return res.status(404).json({ success: false, message: "Product not found" });
     const product = prodRows[0];
 
-    // Fetch product images (gallery)
-    const [images] = await pool.query(`SELECT * FROM ProductImage WHERE product_id = ?`, [id]);
+    const images = await queryDB(`SELECT * FROM ProductImage WHERE product_id = ?`, [id]);
 
-    // Delete main image from FTP if present
+    // Delete main image
     if (product.main_image) {
-      try {
-        await deleteFromFTP(product.main_image);
-      } catch (err) {
-        console.warn("Failed to delete main image:", err.message);
-      }
+      try { await deleteFromFTP(product.main_image); } catch (e) { console.warn("Failed to delete main image:", e.message || e); }
     }
 
-    // Delete gallery images from FTP
-    for (const img of images) {
-      try {
-        await deleteFromFTP(img.image_url);
-      } catch (err) {
-        console.warn("Failed to delete gallery image:", img.image_url, err.message);
-      }
+    // Delete gallery images (best-effort)
+    for (const img of (images || [])) {
+      try { await deleteFromFTP(img.image_url); } catch (e) { console.warn("Failed to delete gallery image:", img.image_url, e.message || e); }
     }
 
     // Delete DB rows
-    await pool.query(`DELETE FROM ProductImage WHERE product_id = ?`, [id]);
-    await pool.query(`DELETE FROM Product WHERE id = ?`, [id]);
+    await queryDB(`DELETE FROM ProductImage WHERE product_id = ?`, [id]);
+    await queryDB(`DELETE FROM Product WHERE id = ?`, [id]);
 
-    // Decrement supplier product count (optional safe)
-    await pool.query(`UPDATE SupplierProfile SET total_products = GREATEST(0, total_products - 1) WHERE id = ?`, [storeId]);
+    // Decrement supplier product count (safe)
+    try {
+      await queryDB(`UPDATE SupplierProfile SET total_products = GREATEST(0, COALESCE(total_products,0) - 1) WHERE id = ?`, [storeId]);
+    } catch (e) {
+      console.warn("Failed to decrement product count (non-fatal):", e.message || e);
+    }
 
-    res.json({ success: true, message: "Product and images deleted successfully" });
+    return res.json({ success: true, message: "Product and images deleted successfully" });
   } catch (err) {
     console.error("❌ Delete product error:", err);
-    res.status(500).json({ success: false, message: "Failed to delete product", error: err.message });
+    return handleDBError(res, err);
   }
 });
-// ✅ PATCH product status
 
+// PATCH product status
 router.patch("/:id/status", verifyToken, async (req, res) => {
-  const { id } = req.params;
-  let { status } = req.body; // frontend may send "paused" or "active"
-  const userId = req.user.userId;
-
-  // Map frontend "paused" to DB "out_of_stock"
-  if (status === "paused") status = "out_of_stock";
-
-  // Only allow valid DB statuses
-  if (!["active", "out_of_stock", "archived"].includes(status)) {
-    return res.status(400).json({ success: false, message: "Invalid status" });
-  }
-
   try {
-    const [supplier] = await pool.query(`SELECT id FROM SupplierProfile WHERE user_id = ?`, [userId]);
-    if (supplier.length === 0) return res.status(404).json({ success: false, message: "Supplier not found" });
-    const storeId = supplier[0].id;
+    const { id } = req.params;
+    let { status } = req.body;
+    const userId = req.user.userId;
 
-    const [rows] = await pool.query(`SELECT * FROM Product WHERE id = ? AND store_id = ?`, [id, storeId]);
-    if (rows.length === 0) return res.status(404).json({ success: false, message: "Product not found" });
+    if (status === "paused") status = "out_of_stock";
+    if (!["active", "out_of_stock", "archived"].includes(status)) {
+      return res.status(400).json({ success: false, message: "Invalid status" });
+    }
 
-    await pool.query(`UPDATE Product SET status = ? WHERE id = ?`, [status, id]);
-    res.json({ success: true, message: `Product status updated to ${status}` });
+    const supplierRows = await queryDB(`SELECT id FROM SupplierProfile WHERE user_id = ? LIMIT 1`, [userId]);
+    if (!supplierRows || supplierRows.length === 0) return res.status(404).json({ success: false, message: "Supplier not found" });
+    const storeId = supplierRows[0].id;
+
+    const rows = await queryDB(`SELECT * FROM Product WHERE id = ? AND store_id = ? LIMIT 1`, [id, storeId]);
+    if (!rows || rows.length === 0) return res.status(404).json({ success: false, message: "Product not found" });
+
+    await queryDB(`UPDATE Product SET status = ?, updated_at = NOW() WHERE id = ?`, [status, id]);
+    return res.json({ success: true, message: `Product status updated to ${status}` });
   } catch (err) {
     console.error("Toggle status error:", err);
-    res.status(500).json({ success: false, message: "Failed to update product status" });
+    return handleDBError(res, err);
   }
 });
 

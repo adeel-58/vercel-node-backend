@@ -1,40 +1,78 @@
-// db.js
+// backend/db.js
 import mysql from "mysql2/promise";
 import dotenv from "dotenv";
 
 dotenv.config();
 
-// ✅ Create MySQL connection pool (Best for high traffic)
-const pool = mysql.createPool({
-  host: process.env.DB_HOST,
-  user: process.env.DB_USER,
-  password: process.env.DB_PASS,
-  database: process.env.DB_NAME,
-  waitForConnections: true,        // Queue requests if connections are busy
-  connectionLimit: 20,            // Allow up to 20 parallel DB connections
-  queueLimit: 0,                  // Unlimited request queue
-  connectTimeout: 20000,          // Prevent ETIMEDOUT errors
-  enableKeepAlive: true,
-  keepAliveInitialDelay: 10000,
-});
+let pool;
 
-// ✅ Log successful connection
-(async () => {
-  try {
-    const [rows] = await pool.query("SELECT 1 + 1 AS result");
-    console.log(`✅ Database connected: ${rows[0].result}`);
-  } catch (error) {
-    console.error("❌ Database connection failed:", error.message);
+/**
+ * Create and return a MySQL connection pool
+ * Optimized for Hostinger MySQL + Vercel Serverless
+ */
+const getPool = () => {
+  if (!pool) {
+    pool = mysql.createPool({
+      host: process.env.DB_HOST,
+      user: process.env.DB_USER,
+      password: process.env.DB_PASS,
+      database: process.env.DB_NAME,
+      port: process.env.DB_PORT ? Number(process.env.DB_PORT) : 3306,
+      waitForConnections: true,
+      connectionLimit: 15,
+      queueLimit: 0,
+      connectTimeout: 15000,
+      enableKeepAlive: true,
+      keepAliveInitialDelay: 10000,
+      ssl: { rejectUnauthorized: false }, // Hostinger SSL Fix
+    });
+
+    console.log("✅ MySQL Pool Initialized");
   }
-})();
+  return pool;
+};
 
-// ✅ Prevent MySQL idle timeout (important for production)
+/**
+ * Stable Query Helper
+ * - Retries on lost connection
+ * - Prevents ETIMEDOUT errors
+ */
+export const queryDB = async (sql, params = []) => {
+  const p = getPool();
+  try {
+    const [rows] = await p.query(sql, params);
+    return rows;
+  } catch (err) {
+    if (
+      err.code === "PROTOCOL_CONNECTION_LOST" ||
+      err.code === "ECONNRESET" ||
+      err.code === "ETIMEDOUT"
+    ) {
+      console.warn("⚠️ DB connection lost. Reconnecting...");
+      pool = null;
+      return queryDB(sql, params); // Retry once
+    }
+    console.error("❌ MySQL Query Error =>", err.message);
+    throw err;
+  }
+};
+
+/**
+ * For manual connections (transactions)
+ */
+export const getConnection = async () => {
+  return await getPool().getConnection();
+};
+
+/**
+ * Prevent idle disconnects with Keep Alive Ping
+ */
 setInterval(async () => {
   try {
-    await pool.query("SELECT 1");
-  } catch (error) {
-    console.error("⚠️ Keep-alive query failed:", error.message);
+    await queryDB("SELECT 1");
+  } catch (err) {
+    console.log("⚠️ Keep-alive failed:", err.message);
   }
-}, 60000); // Every 60 seconds
+}, 60000); // Ping every 60 sec
 
-export default pool;
+export default queryDB;
