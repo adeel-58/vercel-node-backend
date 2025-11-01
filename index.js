@@ -19,13 +19,7 @@ dotenv.config();
 const app = express();
 
 // ✅ Security + Performance Middleware
-app.use(
-  cors({
-    origin: ["http://localhost:5173", "https://storensupply.com/"],
-    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
-  })
-);
+app.use(cors({ origin: "*" }));
 //app.options("*", cors()); // Important for PATCH and DELETE
 app.use(express.json({ limit: "10mb" }));
 // ✅ Health Check
