@@ -5,6 +5,7 @@ import path from "path";
 import fs from "fs";
 import jwt from "jsonwebtoken";
 import FTPClient from "basic-ftp";
+import { Readable } from "stream";
 import queryDB from "../db.js"; // <-- ETIMEDOUT-safe query helper
 
 const router = express.Router();
@@ -33,14 +34,6 @@ const handleDBError = (res, err) => {
     message: "Database error",
     error: err.message || err,
   });
-};
-
-const removeLocalFileSafe = (filePath) => {
-  try {
-    if (filePath && fs.existsSync(filePath)) fs.unlinkSync(filePath);
-  } catch (e) {
-    console.warn("Failed to remove temp file:", filePath, e.message);
-  }
 };
 
 // Normalize remote path for storage (ensure leading slash)
@@ -86,17 +79,17 @@ const ftpAccessConfig = () => ({
   secure: false,
 });
 
-const uploadToFTP = async (localFilePath, remoteFolder) => {
+const uploadToFTP = async (fileBuffer, filename, remoteFolder) => {
   const client = new FTPClient.Client();
   client.ftp.verbose = false;
   try {
     await client.access(ftpAccessConfig());
-    // ensureDir will cd into directory, creating it if needed
     await client.ensureDir(remoteFolder);
-    // change to the dir to avoid path issues and upload basename
-    await client.uploadFrom(localFilePath, path.basename(localFilePath));
-    // return normalized path
-    const remote = normalizeRemotePath(path.posix.join(remoteFolder, path.basename(localFilePath)));
+    
+    // Convert buffer to readable stream for basic-ftp
+    const stream = Readable.from(fileBuffer);
+    await client.uploadFrom(stream, filename);
+    const remote = normalizeRemotePath(path.posix.join(remoteFolder, filename));
     return remote;
   } catch (err) {
     console.error("FTP Upload Error:", err);
@@ -139,20 +132,12 @@ const deleteFromFTP = async (remoteFilePath) => {
   }
 };
 
-// ------------------ Multer Setup (temp storage) ------------------
+// ------------------ Multer Setup (Memory storage for Vercel) ------------------
 
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    const tempPath = path.join(process.cwd(), "temp_uploads");
-    if (!fs.existsSync(tempPath)) fs.mkdirSync(tempPath, { recursive: true });
-    cb(null, tempPath);
-  },
-  filename: (req, file, cb) => {
-    const unique = Date.now() + "-" + Math.round(Math.random() * 1e9);
-    cb(null, `${unique}${path.extname(file.originalname)}`);
-  },
+const upload = multer({ 
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 } // 5MB limit
 });
-const upload = multer({ storage });
 
 // ------------------ Auth Middleware ------------------
 
@@ -191,7 +176,6 @@ router.post("/create", upload.single("logo"), async (req, res) => {
   const logoFile = req.file;
 
   if (!user_id || !store_name) {
-    removeLocalFileSafe(logoFile?.path);
     return res.status(400).json({ success: false, message: "user_id and store_name are required" });
   }
 
@@ -199,7 +183,6 @@ router.post("/create", upload.single("logo"), async (req, res) => {
     // Prevent duplicate supplier profile
     const existing = await queryDB("SELECT id FROM SupplierProfile WHERE user_id = ? LIMIT 1", [user_id]);
     if (existing && existing.length > 0) {
-      removeLocalFileSafe(logoFile?.path);
       return res.status(409).json({ success: false, message: "Supplier profile already exists for this user" });
     }
 
@@ -240,13 +223,12 @@ router.post("/create", upload.single("logo"), async (req, res) => {
     if (logoFile && supplierId) {
       try {
         const remoteFolder = path.posix.join(FTP_BASE_PATH, String(supplierId)); // e.g. /uploads/products/12
-        const remote = await uploadToFTP(logoFile.path, remoteFolder);
+        const filename = `${Date.now()}-${Math.random().toString(36).substr(2, 9)}${path.extname(logoFile.originalname)}`;
+        const remote = await uploadToFTP(logoFile.buffer, filename, remoteFolder);
         finalLogoRemotePath = normalizeRemotePath(remote);
       } catch (uploadErr) {
         console.warn("Logo FTP upload failed (non-fatal):", uploadErr.message || uploadErr);
         // continue - supplier profile is created; we'll inform client below
-      } finally {
-        removeLocalFileSafe(logoFile.path);
       }
 
       if (finalLogoRemotePath) {
@@ -256,9 +238,6 @@ router.post("/create", upload.single("logo"), async (req, res) => {
           console.warn("Failed to update SupplierProfile.logo after upload:", e.message || e);
         }
       }
-    } else {
-      // make sure temp file removed if present but no supplierId
-      removeLocalFileSafe(logoFile?.path);
     }
 
     // 5. Update user role to 'both' (safe update)
@@ -288,7 +267,6 @@ router.post("/create", upload.single("logo"), async (req, res) => {
       note: finalLogoRemotePath ? undefined : logoFile ? "Logo upload failed or skipped." : undefined,
     });
   } catch (err) {
-    removeLocalFileSafe(req.file?.path);
     return handleDBError(res, err);
   }
 });
@@ -306,7 +284,6 @@ router.put("/update", verifyToken, upload.single("logo"), async (req, res) => {
     // Find supplier by user_id
     const supplierRows = await queryDB("SELECT * FROM SupplierProfile WHERE user_id = ? LIMIT 1", [userId]);
     if (!supplierRows || supplierRows.length === 0) {
-      removeLocalFileSafe(logoFile?.path);
       return res.status(404).json({ success: false, message: "Supplier profile not found" });
     }
 
@@ -327,14 +304,12 @@ router.put("/update", verifyToken, upload.single("logo"), async (req, res) => {
       let newRemotePath = null;
       try {
         const remoteFolder = path.posix.join(FTP_BASE_PATH, String(supplierId));
-        const remote = await uploadToFTP(logoFile.path, remoteFolder);
+        const filename = `${Date.now()}-${Math.random().toString(36).substr(2, 9)}${path.extname(logoFile.originalname)}`;
+        const remote = await uploadToFTP(logoFile.buffer, filename, remoteFolder);
         newRemotePath = normalizeRemotePath(remote);
       } catch (uploadErr) {
-        removeLocalFileSafe(logoFile.path);
         console.error("Logo upload failed during update:", uploadErr.message || uploadErr);
         return res.status(500).json({ success: false, message: "Logo upload failed", error: (uploadErr.message || uploadErr) });
-      } finally {
-        removeLocalFileSafe(logoFile.path);
       }
 
       // Attempt delete of old logo (non-fatal)
@@ -363,7 +338,6 @@ router.put("/update", verifyToken, upload.single("logo"), async (req, res) => {
 
     return res.json({ success: true, message: "Supplier updated", supplier: updatedSupplier });
   } catch (err) {
-    removeLocalFileSafe(req.file?.path);
     return handleDBError(res, err);
   }
 });
