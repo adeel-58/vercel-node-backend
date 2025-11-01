@@ -5,6 +5,7 @@ import path from "path";
 import fs from "fs";
 import jwt from "jsonwebtoken";
 import FTPClient from "basic-ftp";
+import { Readable } from "stream";
 import queryDB from "../db.js";
 
 const router = express.Router();
@@ -79,8 +80,9 @@ const uploadToFTP = async (fileBuffer, filename, remoteFolder) => {
     await client.access(ftpAccessConfig());
     await client.ensureDir(remoteFolder);
     
-    // Upload from buffer instead of file path
-    await client.uploadFrom(fileBuffer, filename);
+    // Convert buffer to readable stream for basic-ftp
+    const stream = Readable.from(fileBuffer);
+    await client.uploadFrom(stream, filename);
     const remote = normalizeRemotePath(path.posix.join(remoteFolder, filename));
     return remote;
   } catch (err) {
