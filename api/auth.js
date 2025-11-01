@@ -323,7 +323,7 @@ router.post("/forgot-password", async (req, res) => {
     );
 
     // construct reset link
-    const resetLink = `${process.env.FRONTEND_URL || "http://localhost:5173"}/reset-password?token=${resetToken}`;
+    const resetLink = `${process.env.FRONTEND_URL || "https://storensupply.com"}/reset-password?token=${resetToken}`;
 
     /**
      * 📨 TODO: Send email via Nodemailer or any service
